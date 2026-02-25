@@ -22,7 +22,13 @@ The application is intentionally kept very, very simple to allow developers to e
    - Session management with state persistence
    - Pre-built runtime with common libraries
 
-Try asking the agent to analyze text or execute Python code to see these tools in action.
+3. **VPC Connectivity Tool** - On-agent tool for testing private VPC connectivity:
+   - Tests HTTP connectivity to VPC resources via AWS PrivateLink
+   - Demonstrates secure agent-to-VPC communication patterns
+   - Useful for verifying agents can reach internal services
+   - See [VPC Connectivity Testing Guide](docs/VPC_CONNECTIVITY_TESTING.md) for details
+
+Try asking the agent to analyze text, execute Python code, or test VPC connectivity to see these tools in action.
 
 
 ## FAST User Setup
@@ -57,6 +63,10 @@ The out-of-the-box architecture is shown above. The diagram illustrates the auth
 2. Frontend to AgentCore Runtime (Cognito User Pool JWT validation): The frontend passes the user's JWT in the Authorization header. The Runtime validates the token against the Cognito User Pool.
 3. AgentCore Runtime to AgentCore Gateway (OAuth2 Client Credentials / M2M): The Runtime authenticates as a service using the OAuth2 Client Credentials grant — independent of the user's identity. AgentCore Identity manages token retrieval via the Token Vault.
 4. Frontend to API Gateway (Cognito User Pool JWT validation): API requests are authenticated using a Cognito User Pools Authorizer with the same user JWT from Flow 1.
+
+### PrivateLink Connectivity
+
+FAST includes support for secure connectivity to private VPC resources via AWS PrivateLink. This enables agents to access internal services, databases, or APIs without exposing them to the public internet. The VPC connectivity testing feature demonstrates this capability with a proof-of-concept implementation. See the [VPC Connectivity Testing Guide](docs/VPC_CONNECTIVITY_TESTING.md) for deployment and usage details.
 
 ### Tech Stack
 
@@ -127,8 +137,10 @@ fullstack-agentcore-solution-template/
 │       ├── auth.py         # Authentication helpers
 │       └── ssm.py          # SSM parameter helpers
 ├── tools/                  # Reusable tools (framework-agnostic)
-│   └── code_interpreter/   # AgentCore Code Interpreter integration
-│       └── code_interpreter_tools.py # Core implementation
+│   ├── code_interpreter/   # AgentCore Code Interpreter integration
+│   │   └── code_interpreter_tools.py # Core implementation
+│   └── vpc_connectivity/   # VPC connectivity testing tool
+│       └── vpc_connectivity_tool.py # PrivateLink connectivity testing
 ├── gateway/                # Gateway utilities and tools
 │   └── tools/              # Gateway tool implementations
 │       └── sample_tool/    # Example Gateway tool
@@ -154,6 +166,7 @@ fullstack-agentcore-solution-template/
 │   ├── RUNTIME_GATEWAY_AUTH.md # M2M authentication workflow
 │   ├── STREAMING.md        # Streaming implementation guide
 │   ├── TOOL_AC_CODE_INTERPRETER.md # Code Interpreter guide
+│   ├── VPC_CONNECTIVITY_TESTING.md # VPC connectivity testing guide
 │   └── VERSION_BUMP_PLAYBOOK.md # Version management
 ├── .mkdocs/                # MkDocs build configuration
 │   ├── mkdocs.yml          # MkDocs configuration

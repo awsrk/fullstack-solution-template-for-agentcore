@@ -1,5 +1,5 @@
 import { Button } from "@/components/ui/button"
-import { Plus } from "lucide-react"
+import { Plus, BarChart3 } from "lucide-react"
 import { useAuth } from "@/hooks/useAuth"
 import {
   AlertDialog,
@@ -17,9 +17,17 @@ type ChatHeaderProps = {
   title?: string | undefined
   onNewChat: () => void
   canStartNewChat: boolean
+  onToggleMetrics?: () => void
+  metricsVisible?: boolean
 }
 
-export function ChatHeader({ title, onNewChat, canStartNewChat }: ChatHeaderProps) {
+export function ChatHeader({ 
+  title, 
+  onNewChat, 
+  canStartNewChat,
+  onToggleMetrics,
+  metricsVisible = false
+}: ChatHeaderProps) {
   const { isAuthenticated, signOut } = useAuth()
 
   return (
@@ -28,6 +36,16 @@ export function ChatHeader({ title, onNewChat, canStartNewChat }: ChatHeaderProp
         <h1 className="text-xl font-bold">{title || "Fullstack AgentCore Solution Template"}</h1>
       </div>
       <div className="flex items-center gap-2">
+        {onToggleMetrics && (
+          <Button 
+            onClick={onToggleMetrics} 
+            variant={metricsVisible ? "default" : "outline"} 
+            className="gap-2"
+          >
+            <BarChart3 className="h-4 w-4" />
+            Metrics
+          </Button>
+        )}
         <Button onClick={onNewChat} variant="outline" className="gap-2" disabled={!canStartNewChat}>
           <Plus className="h-4 w-4" />
           New Chat

@@ -1,8 +1,8 @@
-stack_name_base: FAST-stack
+stack_name_base: FAST-stack-1
 
 # Optional: Set to automatically create an admin user and email credentials
 # If not provided, you'll need to manually create users via AWS Console
-admin_user_email: # Example: admin@example.com
+admin_user_email: awsrk@amazon.com # Example: admin@example.com
 
 backend:
   pattern: strands-single-agent # See patterns/ for available options
@@ -12,7 +12,7 @@ backend:
   #   langgraph-* → LangGraph parser  (e.g. langgraph-single-agent)
   #   claude-*    → Claude parser     (e.g. claude-agent-sdk-single-agent)
   # The folder name must match exactly and start with the desired parser prefix.
-  deployment_type: docker # Available deployment types: docker (default), zip (not supported for claude-agent-sdk)
+  deployment_type: zip # Available deployment types: docker (default), zip (not supported for claude-agent-sdk)
   network_mode: PUBLIC # Available network modes: PUBLIC (default), VPC
 
   # Long-term memory uses a SemanticMemoryStrategy to extract and store facts across sessions.

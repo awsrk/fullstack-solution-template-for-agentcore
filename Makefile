@@ -10,7 +10,13 @@ NC := \033[0m  # No Color
 all: lint test
 
 # Run tests
-# TODO
+test:
+	@echo "Running Python tests..."
+	@if [ -d "tests" ] && [ -n "$$(find tests -name 'test_*.py' -type f)" ]; then \
+		pytest tests/ -v; \
+	else \
+		echo "No test files found. Skipping tests."; \
+	fi
 
 # Run all linting and formatting with auto-fix
 lint: ruff-lint format eslint prettier

@@ -8,6 +8,7 @@ import * as dynamodb from "aws-cdk-lib/aws-dynamodb"
 import * as apigateway from "aws-cdk-lib/aws-apigateway"
 import * as logs from "aws-cdk-lib/aws-logs"
 import * as s3 from "aws-cdk-lib/aws-s3"
+import * as ec2 from "aws-cdk-lib/aws-ec2"
 import * as agentcore from "@aws-cdk/aws-bedrock-agentcore-alpha"
 import * as bedrockagentcore from "aws-cdk-lib/aws-bedrockagentcore"
 import { PythonFunction } from "@aws-cdk/aws-lambda-python-alpha"
@@ -26,6 +27,7 @@ export interface BackendStackProps extends cdk.NestedStackProps {
   userPoolClientId: string
   userPoolDomain: cognito.UserPoolDomain
   frontendUrl: string
+  vpcTestServiceEndpointName?: string
 }
 
 export class BackendStack extends cdk.NestedStack {
@@ -41,6 +43,9 @@ export class BackendStack extends cdk.NestedStack {
   private machineClientSecret: secretsmanager.Secret
   private runtimeCredentialProvider: cdk.CustomResource
   private agentRuntime: agentcore.Runtime
+  private vpc?: ec2.IVpc
+  private vpcEndpoint?: ec2.InterfaceVpcEndpoint
+  private memoryId: string
 
   constructor(scope: Construct, id: string, props: BackendStackProps) {
     super(scope, id, props)
@@ -80,7 +85,7 @@ export class BackendStack extends cdk.NestedStack {
     this.createAgentCoreGateway(props.config)
 
     // Create AgentCore Runtime resources
-    this.createAgentCoreRuntime(props.config)
+    this.createAgentCoreRuntime(props.config, props)
 
     // Store runtime ARN in SSM for frontend stack
     this.createRuntimeSSMParameters(props.config)
@@ -91,12 +96,191 @@ export class BackendStack extends cdk.NestedStack {
     // Create Feedback DynamoDB table (example of application data storage)
     const feedbackTable = this.createFeedbackTable(props.config)
 
+    // Create TokenMetrics DynamoDB table for conversation metrics tracking
+    const tokenMetricsTable = this.createTokenMetricsTable(props.config)
+
     // Create API Gateway Feedback API resources (example of best-practice API Gateway + Lambda
     // pattern)
-    this.createFeedbackApi(props.config, props.frontendUrl, feedbackTable)
+    const api = this.createFeedbackApi(props.config, props.frontendUrl, feedbackTable)
+
+    // Create Metrics Lambda and add endpoints to the same API Gateway
+    this.createMetricsApi(props.config, api, tokenMetricsTable)
   }
 
-  private createAgentCoreRuntime(config: AppConfig): void {
+  /**
+   * Creates or imports a VPC for the AgentCore Runtime.
+   * 
+   * If vpc_id is provided in config, imports the existing VPC.
+   * Otherwise, creates a new VPC with the specified CIDR block.
+   * 
+   * The VPC is configured with:
+   * - 2 availability zones for high availability
+   * - Private subnets with NAT Gateway for outbound internet access
+   * - Public subnets for NAT Gateway placement
+   * - DNS hostnames and DNS support enabled for VPC endpoints
+   * 
+   * @param config - Application configuration containing VPC settings
+   * @returns The VPC to use for the AgentCore Runtime
+   */
+  private createOrImportVpc(config: AppConfig): ec2.IVpc {
+    const vpcConfig = config.backend.vpc
+
+    if (!vpcConfig || !vpcConfig.enabled) {
+      throw new Error("VPC configuration is required but not enabled")
+    }
+
+    // Import existing VPC if vpc_id is provided
+    if (vpcConfig.vpc_id) {
+      return ec2.Vpc.fromLookup(this, "ImportedVpc", {
+        vpcId: vpcConfig.vpc_id,
+      })
+    }
+
+    // Create new VPC with specified CIDR or default
+    const vpcCidr = vpcConfig.cidr || "10.0.0.0/16"
+
+    const vpc = new ec2.Vpc(this, "AgentCoreVpc", {
+      vpcName: `${config.stack_name_base}-agentcore-vpc`,
+      ipAddresses: ec2.IpAddresses.cidr(vpcCidr),
+      maxAzs: 2,
+      natGateways: 1, // NAT Gateway for Lambda/Runtime to access AWS services
+      subnetConfiguration: [
+        {
+          name: "Public",
+          subnetType: ec2.SubnetType.PUBLIC,
+          cidrMask: 24,
+        },
+        {
+          name: "Private",
+          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+          cidrMask: 24,
+        },
+      ],
+      enableDnsHostnames: true,
+      enableDnsSupport: true,
+    })
+
+    // Tag the VPC for identification
+    cdk.Tags.of(vpc).add("Name", `${config.stack_name_base}-agentcore-vpc`)
+    cdk.Tags.of(vpc).add("Purpose", "AgentCore Runtime VPC")
+
+    return vpc
+  }
+
+  /**
+   * Creates security groups for the AgentCore Runtime and VPC endpoint.
+   * 
+   * Runtime Security Group:
+   * - Allows outbound HTTPS (443) to AWS services (SSM, Bedrock, etc.)
+   * - Allows outbound HTTP (80) to VPC endpoint for test service
+   * 
+   * VPC Endpoint Security Group:
+   * - Allows inbound HTTP (80) from Runtime security group
+   * 
+   * @param vpc - The VPC to create security groups in
+   * @param config - Application configuration
+   * @returns Object containing the runtime and endpoint security groups
+   */
+  private createSecurityGroups(
+    vpc: ec2.IVpc,
+    config: AppConfig
+  ): { runtimeSg: ec2.SecurityGroup; endpointSg: ec2.SecurityGroup } {
+    // Security group for AgentCore Runtime
+    const runtimeSg = new ec2.SecurityGroup(this, "RuntimeSecurityGroup", {
+      vpc: vpc,
+      securityGroupName: `${config.stack_name_base}-runtime-sg`,
+      description: "Security group for AgentCore Runtime",
+      allowAllOutbound: false, // We'll add specific rules
+    })
+
+    // Allow outbound HTTPS to AWS services (SSM, Bedrock, etc.)
+    runtimeSg.addEgressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(443),
+      "Allow HTTPS to AWS services"
+    )
+
+    // Security group for VPC endpoint
+    const endpointSg = new ec2.SecurityGroup(this, "EndpointSecurityGroup", {
+      vpc: vpc,
+      securityGroupName: `${config.stack_name_base}-endpoint-sg`,
+      description: "Security group for VPC endpoint to test service",
+      allowAllOutbound: false,
+    })
+
+    // Allow inbound HTTP from Runtime to VPC endpoint
+    endpointSg.addIngressRule(
+      runtimeSg,
+      ec2.Port.tcp(80),
+      "Allow HTTP from AgentCore Runtime"
+    )
+
+    // Allow outbound HTTP from Runtime to VPC endpoint
+    runtimeSg.addEgressRule(
+      endpointSg,
+      ec2.Port.tcp(80),
+      "Allow HTTP to VPC endpoint"
+    )
+
+    // Tag security groups
+    cdk.Tags.of(runtimeSg).add("Name", `${config.stack_name_base}-runtime-sg`)
+    cdk.Tags.of(endpointSg).add("Name", `${config.stack_name_base}-endpoint-sg`)
+
+    return { runtimeSg, endpointSg }
+  }
+
+  /**
+   * Creates a VPC endpoint (interface endpoint) to connect to the test service.
+   * 
+   * The VPC endpoint enables private connectivity to the test service via AWS PrivateLink.
+   * It is configured with:
+   * - Deployment in private subnets
+   * - Security group allowing traffic from Runtime
+   * - Private DNS disabled (using endpoint DNS name directly)
+   * 
+   * @param vpc - The VPC to create the endpoint in
+   * @param endpointServiceName - The VPC Endpoint Service name to connect to
+   * @param securityGroup - The security group to attach to the endpoint
+   * @param config - Application configuration
+   * @returns The created VPC endpoint
+   */
+  private createVpcEndpoint(
+    vpc: ec2.IVpc,
+    endpointServiceName: string,
+    securityGroup: ec2.SecurityGroup,
+    config: AppConfig
+  ): ec2.InterfaceVpcEndpoint {
+    const vpcEndpoint = new ec2.InterfaceVpcEndpoint(this, "TestServiceVpcEndpoint", {
+      vpc: vpc,
+      service: new ec2.InterfaceVpcEndpointService(endpointServiceName),
+      subnets: {
+        subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+      },
+      securityGroups: [securityGroup],
+      privateDnsEnabled: false, // We'll use the endpoint DNS name directly
+    })
+
+    // Tag the VPC endpoint
+    cdk.Tags.of(vpcEndpoint).add(
+      "Name",
+      `${config.stack_name_base}-test-service-endpoint`
+    )
+
+    // Store the VPC endpoint URL in SSM for the VPC connectivity tool
+    // The tool will use this to make HTTP requests to the test service
+    // The DNS name is in the format: vpce-xxxxx.vpce-svc-xxxxx.region.vpce.amazonaws.com
+    // We construct the full HTTP URL for the tool to use
+    const endpointUrl = `http://${vpcEndpoint.vpcEndpointDnsEntries[0]}`
+    new ssm.StringParameter(this, "VpcTestEndpointUrlParam", {
+      parameterName: `/${config.stack_name_base}/vpc_test_endpoint_url`,
+      stringValue: endpointUrl,
+      description: "VPC endpoint URL for connectivity testing (HTTP)",
+    })
+
+    return vpcEndpoint
+  }
+
+  private createAgentCoreRuntime(config: AppConfig, props: BackendStackProps): void {
     const pattern = config.backend?.pattern || "strands-single-agent"
 
     // Parameters
@@ -112,6 +296,7 @@ export class BackendStack extends cdk.NestedStack {
     // Create the agent runtime artifact based on deployment type
     let agentRuntimeArtifact: agentcore.AgentRuntimeArtifact
     let zipPackagerResource: cdk.CustomResource | undefined
+    let contentHash: string | undefined
 
     if (
       deploymentType === "zip" &&
@@ -159,12 +344,18 @@ export class BackendStack extends cdk.NestedStack {
         }
       }
 
-      // Read shared modules (gateway/, tools/)
+      // Read shared modules (gateway/, tools/, patterns/utils/)
       for (const module of ["gateway", "tools"]) {
         const moduleDir = path.join(repoRoot, module) // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
         if (fs.existsSync(moduleDir)) {
           this.readDirRecursive(moduleDir, module, agentCode)
         }
+      }
+      
+      // Read patterns/utils module (shared utilities for agents)
+      const utilsDir = path.join(repoRoot, "patterns", "utils")
+      if (fs.existsSync(utilsDir)) {
+        this.readDirRecursive(utilsDir, "utils", agentCode)
       }
 
       // Read requirements
@@ -177,7 +368,7 @@ export class BackendStack extends cdk.NestedStack {
 
       // Create hash for change detection
       // We use this to trigger update when content changes
-      const contentHash = this.hashContent(JSON.stringify({ requirements, agentCode }))
+      contentHash = this.hashContent(JSON.stringify({ requirements, agentCode }))
 
       // Custom Resource to trigger packaging
       const provider = new cr.Provider(this, "ZipPackagerProvider", {
@@ -265,8 +456,9 @@ export class BackendStack extends cdk.NestedStack {
     const memoryId = memory.getAtt("MemoryId").toString()
     const memoryArn = memory.getAtt("MemoryArn").toString()
 
-    // Store the memory ARN for access from main stack
+    // Store the memory ARN and ID for access from other methods
     this.memoryArn = memoryArn
+    this.memoryId = memoryId
 
     // Add memory-specific permissions to agent role
     agentRole.addToPolicy(
@@ -366,6 +558,11 @@ export class BackendStack extends cdk.NestedStack {
     if (pattern === "claude-agent-sdk-single-agent" || pattern === "claude-agent-sdk-multi-agent") {
       envVars["CLAUDE_CODE_USE_BEDROCK"] = "1"
     }
+    
+    // For ZIP deployment, add content hash to force runtime updates when code changes
+    if (contentHash) {
+      envVars.DEPLOYMENT_HASH = contentHash
+    }
 
     // Create the runtime using L2 construct
     // requestHeaderConfiguration allows the agent to read the Authorization header
@@ -422,6 +619,23 @@ export class BackendStack extends cdk.NestedStack {
       description: "ARN of the agent memory resource",
       value: memoryArn,
     })
+
+    // VPC outputs (if VPC is enabled)
+    if (this.vpc) {
+      new cdk.CfnOutput(this, "AgentCoreVpcId", {
+        description: "VPC ID for AgentCore Runtime",
+        value: this.vpc.vpcId,
+        exportName: `${config.stack_name_base}-AgentCoreVpcId`,
+      })
+    }
+
+    if (this.vpcEndpoint) {
+      new cdk.CfnOutput(this, "VpcEndpointId", {
+        description: "VPC Endpoint ID for test service connectivity",
+        value: this.vpcEndpoint.vpcEndpointId,
+        exportName: `${config.stack_name_base}-VpcEndpointId`,
+      })
+    }
   }
 
   private createRuntimeSSMParameters(config: AppConfig): void {
@@ -494,6 +708,61 @@ export class BackendStack extends cdk.NestedStack {
   }
 
   /**
+   * Creates a DynamoDB table for storing token metrics per conversation session.
+   * 
+   * The table tracks cumulative token usage (input, output, total) for each conversation
+   * session. Metrics are automatically deleted after 7 days using DynamoDB TTL.
+   * 
+   * Table Schema:
+   * - Partition Key: sessionId (String) - Unique conversation session identifier
+   * - Attributes:
+   *   - inputTokens (Number) - Cumulative input tokens for the session
+   *   - outputTokens (Number) - Cumulative output tokens for the session
+   *   - totalTokens (Number) - Cumulative total tokens (input + output)
+   *   - lastUpdated (String) - ISO 8601 timestamp of last update
+   *   - ttl (Number) - Unix timestamp for automatic deletion (7 days)
+   * 
+   * Access Patterns:
+   * - Get metrics by sessionId (Query)
+   * - Update metrics by sessionId (UpdateItem with ADD operation for atomic increments)
+   * 
+   * @param config - Application configuration containing stack name
+   * @returns The created DynamoDB table
+   */
+  private createTokenMetricsTable(config: AppConfig): dynamodb.Table {
+    const tokenMetricsTable = new dynamodb.Table(this, "TokenMetricsTable", {
+      tableName: `${config.stack_name_base}-token-metrics`,
+      partitionKey: {
+        name: "sessionId",
+        type: dynamodb.AttributeType.STRING,
+      },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+      timeToLiveAttribute: "ttl", // Enable TTL for automatic deletion after 7 days
+    })
+
+    // Output the table name for reference
+    new cdk.CfnOutput(this, "TokenMetricsTableName", {
+      description: "DynamoDB table name for token metrics storage",
+      value: tokenMetricsTable.tableName,
+      exportName: `${config.stack_name_base}-TokenMetricsTableName`,
+    })
+
+    // Store table name in SSM for Lambda functions to access
+    new ssm.StringParameter(this, "TokenMetricsTableNameParam", {
+      parameterName: `/${config.stack_name_base}/token-metrics-table-name`,
+      stringValue: tokenMetricsTable.tableName,
+      description: "DynamoDB table name for token metrics",
+    })
+
+    return tokenMetricsTable
+  }
+
+  /**
    * Creates an API Gateway with Lambda integration for the feedback endpoint.
    * This is an EXAMPLE implementation demonstrating best practices for API Gateway + Lambda.
    *
@@ -520,7 +789,7 @@ export class BackendStack extends cdk.NestedStack {
     config: AppConfig,
     frontendUrl: string,
     feedbackTable: dynamodb.Table
-  ): void {
+  ): apigateway.RestApi {
     // Create Lambda function for feedback using Python
     // ARM_64 required — matches Powertools ARM64 layer and avoids cross-platform
     const feedbackLambda = new PythonFunction(this, "FeedbackLambda", {
@@ -564,7 +833,7 @@ export class BackendStack extends cdk.NestedStack {
       description: "API for user feedback and future endpoints",
       defaultCorsPreflightOptions: {
         allowOrigins: [frontendUrl, "http://localhost:3000"],
-        allowMethods: ["POST", "OPTIONS"],
+        allowMethods: ["GET", "POST", "OPTIONS"],
         allowHeaders: ["Content-Type", "Authorization"],
       },
       deployOptions: {
@@ -622,6 +891,203 @@ export class BackendStack extends cdk.NestedStack {
       parameterName: `/${config.stack_name_base}/feedback-api-url`,
       stringValue: api.url,
       description: "Feedback API Gateway URL",
+    })
+
+    return api
+  }
+
+  /**
+   * Creates Metrics Lambda and adds metrics endpoints to the existing API Gateway.
+   * 
+   * This method adds three new GET endpoints to the API Gateway for conversation metrics:
+   * - GET /metrics?sessionId={id} - Returns token and memory metrics for a session
+   * - GET /agents - Returns list of available agents from AgentCore Gateway
+   * - GET /tools - Returns list of available tools from AgentCore Gateway
+   * 
+   * All endpoints require Cognito JWT authentication and have caching configured:
+   * - /metrics: 5 second cache TTL (frequently changing data)
+   * - /agents: 5 minute cache TTL (rarely changing data)
+   * - /tools: 5 minute cache TTL (rarely changing data)
+   * 
+   * The Lambda function has permissions to:
+   * - Read from TokenMetrics DynamoDB table
+   * - Query AgentCore Memory for event counts
+   * - Read SSM parameters for Gateway URL lookup
+   * 
+   * @param config - Application configuration containing stack name
+   * @param api - Existing API Gateway instance to add endpoints to
+   * @param tokenMetricsTable - DynamoDB table for token metrics storage
+   */
+  private createMetricsApi(
+    config: AppConfig,
+    api: apigateway.RestApi,
+    tokenMetricsTable: dynamodb.Table
+  ): void {
+    // Create Lambda function for metrics using Python
+    const metricsLambda = new PythonFunction(this, "MetricsLambda", {
+      functionName: `${config.stack_name_base}-metrics`,
+      runtime: lambda.Runtime.PYTHON_3_13,
+      entry: path.join(__dirname, "..", "lambdas", "metrics"),
+      handler: "handler",
+      environment: {
+        TOKEN_METRICS_TABLE_NAME: tokenMetricsTable.tableName,
+        CORS_ALLOWED_ORIGINS: "*", // Will be restricted by API Gateway CORS config
+        AGENTCORE_MEMORY_ID: this.memoryId,
+        AGENTCORE_GATEWAY_URL: `/${config.stack_name_base}/gateway_url`, // SSM parameter path
+        STACK_NAME: config.stack_name_base, // Required for Gateway authentication
+      },
+      timeout: cdk.Duration.seconds(30),
+      layers: [
+        lambda.LayerVersion.fromLayerVersionArn(
+          this,
+          "MetricsPowertoolsLayer",
+          `arn:aws:lambda:${
+            cdk.Stack.of(this).region
+          }:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-arm64:18`
+        ),
+      ],
+      logGroup: new logs.LogGroup(this, "MetricsLambdaLogGroup", {
+        logGroupName: `/aws/lambda/${config.stack_name_base}-metrics`,
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+
+    // Grant Lambda permissions to read from DynamoDB
+    tokenMetricsTable.grantReadData(metricsLambda)
+
+    // Grant Lambda permissions to query AgentCore Memory
+    metricsLambda.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "AgentCoreMemoryAccess",
+        effect: iam.Effect.ALLOW,
+        actions: ["bedrock-agentcore:ListEvents"],
+        resources: [this.memoryArn],
+      })
+    )
+
+    // Grant Lambda permissions to read SSM parameters for Gateway URL and credentials
+    metricsLambda.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "SSMParameterReadAccess",
+        effect: iam.Effect.ALLOW,
+        actions: ["ssm:GetParameter", "ssm:GetParameters"],
+        resources: [
+          `arn:aws:ssm:${this.region}:${this.account}:parameter/${config.stack_name_base}/*`,
+        ],
+      })
+    )
+
+    // Grant Lambda permissions to read Secrets Manager secrets for machine client credentials
+    metricsLambda.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "SecretsManagerReadAccess",
+        effect: iam.Effect.ALLOW,
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:/${config.stack_name_base}/machine_client_secret*`,
+        ],
+      })
+    )
+
+    // Get existing authorizer and request validator from the API
+    // We reuse the same Cognito authorizer created for the feedback endpoint
+    const authorizer = new apigateway.CognitoUserPoolsAuthorizer(this, "MetricsApiAuthorizer", {
+      cognitoUserPools: [this.userPool],
+      identitySource: "method.request.header.Authorization",
+      authorizerName: `${config.stack_name_base}-metrics-authorizer`,
+    })
+
+    const requestValidator = new apigateway.RequestValidator(this, "MetricsApiRequestValidator", {
+      restApi: api,
+      requestValidatorName: `${config.stack_name_base}-metrics-request-validator`,
+      validateRequestBody: false,
+      validateRequestParameters: true,
+    })
+
+    // Create /metrics resource with GET method
+    // Cache TTL: 5 seconds (metrics change frequently)
+    const metricsResource = api.root.addResource("metrics")
+    metricsResource.addMethod(
+      "GET",
+      new apigateway.LambdaIntegration(metricsLambda, {
+        cacheKeyParameters: ["method.request.querystring.sessionId"],
+      }),
+      {
+        authorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+        requestValidator: requestValidator,
+        requestParameters: {
+          "method.request.querystring.sessionId": true, // Required query parameter
+        },
+        methodResponses: [
+          {
+            statusCode: "200",
+            responseParameters: {
+              "method.response.header.Cache-Control": true,
+            },
+          },
+        ],
+      }
+    )
+
+    // Create /agents resource with GET method
+    // Cache TTL: 5 minutes (agents rarely change)
+    const agentsResource = api.root.addResource("agents")
+    agentsResource.addMethod(
+      "GET",
+      new apigateway.LambdaIntegration(metricsLambda),
+      {
+        authorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+        methodResponses: [
+          {
+            statusCode: "200",
+            responseParameters: {
+              "method.response.header.Cache-Control": true,
+            },
+          },
+        ],
+      }
+    )
+
+    // Create /tools resource with GET method
+    // Cache TTL: 5 minutes (tools rarely change)
+    const toolsResource = api.root.addResource("tools")
+    toolsResource.addMethod(
+      "GET",
+      new apigateway.LambdaIntegration(metricsLambda),
+      {
+        authorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+        methodResponses: [
+          {
+            statusCode: "200",
+            responseParameters: {
+              "method.response.header.Cache-Control": true,
+            },
+          },
+        ],
+      }
+    )
+
+    // Output the metrics endpoints for reference
+    new cdk.CfnOutput(this, "MetricsEndpoint", {
+      description: "Metrics API endpoint URL",
+      value: `${api.url}metrics`,
+      exportName: `${config.stack_name_base}-MetricsEndpoint`,
+    })
+
+    new cdk.CfnOutput(this, "AgentsEndpoint", {
+      description: "Agents API endpoint URL",
+      value: `${api.url}agents`,
+      exportName: `${config.stack_name_base}-AgentsEndpoint`,
+    })
+
+    new cdk.CfnOutput(this, "ToolsEndpoint", {
+      description: "Tools API endpoint URL",
+      value: `${api.url}tools`,
+      exportName: `${config.stack_name_base}-ToolsEndpoint`,
     })
   }
 

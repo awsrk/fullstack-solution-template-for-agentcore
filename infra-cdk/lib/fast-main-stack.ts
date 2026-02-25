@@ -6,6 +6,7 @@ import { AppConfig } from "./utils/config-manager"
 import { BackendStack } from "./backend-stack"
 import { AmplifyHostingStack } from "./amplify-hosting-stack"
 import { CognitoStack } from "./cognito-stack"
+import { VpcTestServiceStack } from "./vpc-test-service-stack"
 
 export interface FastAmplifyStackProps extends cdk.StackProps {
   config: AppConfig
@@ -15,6 +16,7 @@ export class FastMainStack extends cdk.Stack {
   public readonly amplifyHostingStack: AmplifyHostingStack
   public readonly backendStack: BackendStack
   public readonly cognitoStack: CognitoStack
+  public readonly vpcTestServiceStack: VpcTestServiceStack
 
   constructor(scope: Construct, id: string, props: FastAmplifyStackProps) {
     const description =
@@ -31,13 +33,21 @@ export class FastMainStack extends cdk.Stack {
       callbackUrls: ["http://localhost:3000", this.amplifyHostingStack.amplifyUrl],
     })
 
-    // Step 2: Create backend stack with the predictable Amplify URL and Cognito details
+    // Step 2: Create VPC test service stack (must be created before backend stack)
+    // TEMPORARILY DISABLED: VPC Endpoint Service creation is failing
+    // TODO: Fix VPC Endpoint Service to work with ALB or find alternative architecture
+    // this.vpcTestServiceStack = new VpcTestServiceStack(this, `${id}-vpc-test-service`, {
+    //   config: props.config,
+    // })
+
+    // Step 3: Create backend stack with the predictable Amplify URL and Cognito details
     this.backendStack = new BackendStack(this, `${id}-backend`, {
       config: props.config,
       userPoolId: this.cognitoStack.userPoolId,
       userPoolClientId: this.cognitoStack.userPoolClientId,
       userPoolDomain: this.cognitoStack.userPoolDomain,
       frontendUrl: this.amplifyHostingStack.amplifyUrl,
+      vpcTestServiceEndpointName: undefined, // this.vpcTestServiceStack.endpointServiceName,
     })
 
     // Outputs
@@ -98,5 +108,12 @@ export class FastMainStack extends cdk.Stack {
       description: "S3 bucket for Amplify deployment staging",
       exportName: `${props.config.stack_name_base}-StagingBucket`,
     })
+
+    // TEMPORARILY DISABLED: VPC test service output
+    // new cdk.CfnOutput(this, "VpcTestServiceEndpoint", {
+    //   value: this.vpcTestServiceStack.endpointServiceName,
+    //   description: "VPC Endpoint Service name for connectivity testing",
+    //   exportName: `${props.config.stack_name_base}-VpcTestServiceEndpoint`,
+    // })
   }
 }

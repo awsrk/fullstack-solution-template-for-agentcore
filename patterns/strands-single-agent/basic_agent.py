@@ -92,6 +92,9 @@ def create_strands_agent(user_id: str, session_id: str) -> Agent:
 
     region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
     code_tools = StrandsCodeInterpreterTools(region)
+    
+    # VPC Connectivity Tool disabled - uncomment when VPC is configured
+    # vpc_connectivity_tool = create_vpc_connectivity_tool(region=region)
 
     gateway_client = create_gateway_mcp_client()
 

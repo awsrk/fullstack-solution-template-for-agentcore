@@ -4,12 +4,14 @@ import { useEffect, useRef, useState } from "react"
 import { ChatHeader } from "./ChatHeader"
 import { ChatInput } from "./ChatInput"
 import { ChatMessages } from "./ChatMessages"
+import { MetricsPanel } from "./MetricsPanel"
 import { Message, MessageSegment, ToolCall } from "./types"
 
 import { useGlobal } from "@/app/context/GlobalContext"
 import { AgentCoreClient } from "@/lib/agentcore-client"
 import type { AgentPattern } from "@/lib/agentcore-client"
 import { submitFeedback } from "@/services/feedbackService"
+import { metricsService, type MetricsData, type Agent, type Tool } from "@/services/metricsService"
 import { useAuth } from "react-oidc-context"
 import { useDefaultTool } from "@/hooks/useToolRenderer"
 import { ToolCallDisplay } from "./ToolCallDisplay"
@@ -20,6 +22,14 @@ export default function ChatInterface() {
   const [error, setError] = useState<string | null>(null)
   const [client, setClient] = useState<AgentCoreClient | null>(null)
   const [sessionId, setSessionId] = useState(() => crypto.randomUUID())
+
+  // Metrics state
+  const [metricsVisible, setMetricsVisible] = useState(false)
+  const [metrics, setMetrics] = useState<MetricsData | null>(null)
+  const [agents, setAgents] = useState<Agent[]>([])
+  const [tools, setTools] = useState<Tool[]>([])
+  const [metricsLoading, setMetricsLoading] = useState(false)
+  const [metricsError, setMetricsError] = useState<string | null>(null)
 
   const { isLoading, setIsLoading } = useGlobal()
   const auth = useAuth()
@@ -66,6 +76,36 @@ export default function ChatInterface() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [messages])
+
+  // Fetch metrics after each message
+  useEffect(() => {
+    async function fetchMetrics() {
+      if (!auth.user?.id_token || messages.length === 0) return
+
+      setMetricsLoading(true)
+      setMetricsError(null)
+
+      try {
+        const [metricsData, agentsData, toolsData] = await Promise.all([
+          metricsService.fetchMetrics(sessionId, auth.user.id_token),
+          metricsService.fetchAgents(auth.user.id_token),
+          metricsService.fetchTools(auth.user.id_token),
+        ])
+
+        setMetrics(metricsData)
+        setAgents(agentsData)
+        setTools(toolsData)
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : "Unknown error"
+        setMetricsError(`Failed to fetch metrics: ${errorMessage}`)
+        console.error("Error fetching metrics:", err)
+      } finally {
+        setMetricsLoading(false)
+      }
+    }
+
+    fetchMetrics()
+  }, [messages, sessionId, auth.user?.id_token])
 
   const sendMessage = async (userMessage: string) => {
     if (!userMessage.trim() || !client) return
@@ -252,6 +292,11 @@ export default function ChatInterface() {
     setInput("")
     setError(null)
     setSessionId(crypto.randomUUID())
+    // Reset metrics
+    setMetrics(null)
+    setAgents([])
+    setTools([])
+    metricsService.clearCache()
   }
 
   // Check if this is the initial state (no messages)
@@ -261,61 +306,39 @@ export default function ChatInterface() {
   const hasAssistantMessages = messages.some(message => message.role === "assistant")
 
   return (
-    <div className="flex flex-col h-screen w-full">
-      {/* Fixed header */}
-      <div className="flex-none">
-        <ChatHeader onNewChat={startNewChat} canStartNewChat={hasAssistantMessages} />
-        {error && (
-          <div className="bg-red-50 border-l-4 border-red-500 p-4 mx-4 mt-2">
-            <p className="text-sm text-red-700">{error}</p>
-          </div>
-        )}
-      </div>
-
-      {/* Conditional layout based on whether there are messages */}
-      {isInitialState ? (
-        // Initial state - input in the middle
-        <>
-          {/* Empty space above */}
-          <div className="grow" />
-
-          {/* Centered welcome message */}
-          <div className="text-center mb-6">
-            <h2 className="text-2xl font-bold text-gray-800">Welcome to FAST Chat</h2>
-            <p className="text-gray-600 mt-2">Ask me anything to get started</p>
-          </div>
-
-          {/* Centered input */}
-          <div className="px-4 mb-16 max-w-4xl mx-auto w-full">
-            <ChatInput
-              input={input}
-              setInput={setInput}
-              handleSubmit={handleSubmit}
-              isLoading={isLoading}
-            />
-          </div>
-
-          {/* Empty space below */}
-          <div className="grow" />
-        </>
-      ) : (
-        // Chat in progress - normal layout
-        <>
-          {/* Scrollable message area */}
-          <div className="grow overflow-hidden">
-            <div className="max-w-4xl mx-auto w-full h-full">
-              <ChatMessages
-                messages={messages}
-                messagesEndRef={messagesEndRef}
-                sessionId={sessionId}
-                onFeedbackSubmit={handleFeedbackSubmit}
-              />
+    <div className="flex h-screen w-full">
+      {/* Main chat area */}
+      <div className="flex flex-col flex-1">
+        {/* Fixed header */}
+        <div className="flex-none">
+          <ChatHeader 
+            onNewChat={startNewChat} 
+            canStartNewChat={hasAssistantMessages}
+            onToggleMetrics={() => setMetricsVisible(!metricsVisible)}
+            metricsVisible={metricsVisible}
+          />
+          {error && (
+            <div className="bg-red-50 border-l-4 border-red-500 p-4 mx-4 mt-2">
+              <p className="text-sm text-red-700">{error}</p>
             </div>
-          </div>
+          )}
+        </div>
 
-          {/* Fixed input area at bottom */}
-          <div className="flex-none">
-            <div className="max-w-4xl mx-auto w-full">
+        {/* Conditional layout based on whether there are messages */}
+        {isInitialState ? (
+          // Initial state - input in the middle
+          <>
+            {/* Empty space above */}
+            <div className="grow" />
+
+            {/* Centered welcome message */}
+            <div className="text-center mb-6">
+              <h2 className="text-2xl font-bold text-gray-800">Welcome to FAST Chat</h2>
+              <p className="text-gray-600 mt-2">Ask me anything to get started</p>
+            </div>
+
+            {/* Centered input */}
+            <div className="px-4 mb-16 max-w-4xl mx-auto w-full">
               <ChatInput
                 input={input}
                 setInput={setInput}
@@ -323,8 +346,54 @@ export default function ChatInterface() {
                 isLoading={isLoading}
               />
             </div>
-          </div>
-        </>
+
+            {/* Empty space below */}
+            <div className="grow" />
+          </>
+        ) : (
+          // Chat in progress - normal layout
+          <>
+            {/* Scrollable message area */}
+            <div className="grow overflow-hidden">
+              <div className="max-w-4xl mx-auto w-full h-full">
+                <ChatMessages
+                  messages={messages}
+                  messagesEndRef={messagesEndRef}
+                  sessionId={sessionId}
+                  onFeedbackSubmit={handleFeedbackSubmit}
+                />
+              </div>
+            </div>
+
+            {/* Fixed input area at bottom */}
+            <div className="flex-none">
+              <div className="max-w-4xl mx-auto w-full">
+                <ChatInput
+                  input={input}
+                  setInput={setInput}
+                  handleSubmit={handleSubmit}
+                  isLoading={isLoading}
+                />
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Metrics Panel - Side panel */}
+      {metricsVisible && (
+        <div className="flex-none w-96 border-l border-gray-200 overflow-y-auto p-4">
+          <MetricsPanel
+            sessionId={sessionId}
+            isVisible={metricsVisible}
+            onToggle={() => setMetricsVisible(false)}
+            metrics={metrics}
+            agents={agents}
+            tools={tools}
+            isLoading={metricsLoading}
+            error={metricsError}
+          />
+        </div>
       )}
     </div>
   )
