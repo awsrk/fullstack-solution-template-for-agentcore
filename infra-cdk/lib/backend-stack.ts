@@ -1160,7 +1160,7 @@ export class BackendStack extends cdk.NestedStack {
       runtime: lambda.Runtime.PYTHON_3_13,
       architecture: lambda.Architecture.ARM_64,
       entry: path.join(__dirname, "../../gateway/tools/broker_card"), // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
-      handler: "handler",
+      handler: "lambda_function.handler",
       timeout: cdk.Duration.seconds(60),
       logGroup: new logs.LogGroup(this, "BrokerCardToolLambdaLogGroup", {
         logGroupName: `/aws/lambda/${config.stack_name_base}-broker-card-tool`,
@@ -1182,7 +1182,7 @@ export class BackendStack extends cdk.NestedStack {
       runtime: lambda.Runtime.PYTHON_3_13,
       architecture: lambda.Architecture.ARM_64,
       entry: path.join(__dirname, "../../gateway/tools/broker_memory"), // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
-      handler: "handler",
+      handler: "lambda_function.handler",
       timeout: cdk.Duration.seconds(30),
       environment: {
         MEMORY_ID: this.memoryId,
