@@ -73,6 +73,15 @@ export default function ChatInterface() {
     loadConfig()
   }, [])
 
+  // Fire a silent warmup call as soon as the client and auth are ready so the
+  // AgentCore instance is initialized before the user sends their first message.
+  useEffect(() => {
+    if (!client || !auth.user?.access_token) return
+    client
+      .invoke("warmup", sessionId, auth.user.access_token, () => {})
+      .catch(() => {})
+  }, [client, auth.user?.access_token])
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [messages])

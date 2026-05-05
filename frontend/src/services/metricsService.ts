@@ -105,8 +105,9 @@ export class MetricsService {
       })
 
       // Update cache with fresh data
-      this.cache = { ...data, isStale: false }
-      return this.cache
+      const metricsData: MetricsData = { ...data, isStale: false }
+      this.cache = metricsData
+      return metricsData
     } catch (error) {
       console.error("Error fetching metrics:", error)
 
