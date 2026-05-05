@@ -1,4 +1,4 @@
-"""Strands agent with Gateway MCP tools, Memory, and Code Interpreter."""
+"""Market trends Strands agent — all tools served via AgentCore Gateway."""
 
 import json
 import logging
@@ -14,50 +14,68 @@ from bedrock_agentcore.memory.integrations.strands.session_manager import (
 from bedrock_agentcore.runtime import BedrockAgentCoreApp, RequestContext
 from strands import Agent
 from strands.models import BedrockModel
+from tools.code_interpreter import StrandsCodeInterpreterTools
 from tools.gateway import create_gateway_mcp_client
 from utils.auth import extract_user_id_from_context
-
-from tools.code_interpreter import StrandsCodeInterpreterTools
 
 logger = logging.getLogger(__name__)
 
 app = BedrockAgentCoreApp()
 
-SYSTEM_PROMPT = (
-    "You are a helpful assistant with access to tools via the Gateway and Code Interpreter. "
-    "When asked about your tools, list them and explain what they do."
-)
+_SYSTEM_PROMPT_TEMPLATE = """You are an expert market intelligence analyst with deep expertise in financial markets, business strategy, and economic trends. You have advanced long-term memory capabilities to store and recall financial interests for each broker you work with.
+
+CURRENT SESSION ID: {session_id}
+Pass this session_id value whenever a broker memory tool requires it.
+
+PURPOSE:
+- Provide real-time market analysis and stock data
+- Maintain long-term financial profiles for each broker/client
+- Store and recall investment preferences, risk tolerance, and financial goals
+- Deliver personalised investment insights based on stored broker profiles
+
+AVAILABLE TOOLS (via Gateway):
+
+Real-Time Market Data:
+- gateway_get_stock_data(symbol): Live stock prices, daily change, and key market data
+- gateway_search_news(query, news_source): Headlines from Bloomberg, Reuters, CNBC, WSJ, Financial Times, Yahoo Finance, MarketWatch, Seeking Alpha
+
+Broker Profile Collection:
+- gateway_parse_broker_profile_from_message(user_message): Parse structured broker card
+- gateway_generate_market_summary_for_broker(broker_profile, market_data): Tailored market briefing
+- gateway_get_broker_card_template(): Standard broker card template
+- gateway_collect_broker_preferences_interactively(preference_type): Collect missing preferences
+
+Broker Memory — always call identify_broker FIRST, then pass the returned actor_id:
+- gateway_identify_broker(user_message): Extract actor_id — CALL THIS FIRST
+- gateway_get_broker_financial_profile(actor_id, session_id): Retrieve stored investment profile
+- gateway_update_broker_financial_interests(interests_update, actor_id, session_id): Persist new profile info
+- gateway_list_conversation_history(actor_id, session_id): Recent conversation history
+
+Code Interpreter: Execute Python for data analysis, charting, or calculations.
+
+MANDATORY BROKER IDENTIFICATION WORKFLOW:
+1. If ANY user message contains names, introductions, company names, roles, or broker card fields:
+   → IMMEDIATELY call gateway_identify_broker(user_message) as your FIRST action
+   → Use the returned actor_id AND the session_id above for ALL subsequent memory tool calls
+2. Returning broker: call gateway_get_broker_financial_profile and personalise the response
+3. New broker: collect profile via broker card tools, then store with gateway_update_broker_financial_interests
+4. Anonymous market question: skip identification and answer directly
+
+PROFESSIONAL STANDARDS:
+- Deliver institutional-quality analysis tailored to each broker's stored risk tolerance
+- Reference their specific investment goals and time horizons from their profile
+- Provide recommendations aligned with their stored investment style"""
 
 
-def _create_session_manager(
-    user_id: str, session_id: str
-) -> AgentCoreMemorySessionManager:
-    """Create an AgentCore memory session manager, optionally with long-term semantic retrieval.
-
-    When the USE_LONG_TERM_MEMORY environment variable is "true", configures retrieval
-    from the /facts/{actorId} namespace so the agent recalls facts across sessions.
-    When false (default), only short-term memory (conversation history) is active,
-    avoiding the additional storage and retrieval costs of long-term memory.
-
-    Args:
-        user_id: Unique identifier for the user (actor), extracted from the JWT sub claim.
-        session_id: Unique identifier for the current conversation session.
-
-    Returns:
-        An AgentCoreMemorySessionManager bound to the user and session.
-    """
+def _create_session_manager(user_id: str, session_id: str) -> AgentCoreMemorySessionManager:
     memory_id = os.environ.get("MEMORY_ID")
     if not memory_id:
         raise ValueError("MEMORY_ID environment variable is required")
 
     use_ltm = os.environ.get("USE_LONG_TERM_MEMORY", "false").lower() == "true"
-
     top_k = int(os.environ.get("LTM_TOP_K", "10"))
     relevance_score = float(os.environ.get("LTM_RELEVANCE_SCORE", "0.3"))
 
-    # Only pass retrieval_config when LTM is explicitly enabled.
-    # Omitting it means the session manager uses short-term memory only,
-    # which avoids the $0.50/1,000 retrieval and $0.75/1,000 storage costs.
     retrieval_config = (
         {
             "/facts/{actorId}": RetrievalConfig(
@@ -81,9 +99,7 @@ def _create_session_manager(
     )
 
 
-def create_strands_agent(user_id: str, session_id: str) -> Agent:
-    """Create a Strands agent with Gateway tools, memory, and Code Interpreter."""
-
+def create_market_trends_agent(user_id: str, session_id: str) -> Agent:
     bedrock_model = BedrockModel(
         model_id="us.anthropic.claude-sonnet-4-5-20250929-v1:0", temperature=0.1
     )
@@ -92,15 +108,11 @@ def create_strands_agent(user_id: str, session_id: str) -> Agent:
 
     region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
     code_tools = StrandsCodeInterpreterTools(region)
-    
-    # VPC Connectivity Tool disabled - uncomment when VPC is configured
-    # vpc_connectivity_tool = create_vpc_connectivity_tool(region=region)
-
     gateway_client = create_gateway_mcp_client()
 
     return Agent(
-        name="strands_agent",
-        system_prompt=SYSTEM_PROMPT,
+        name="market_trends_agent",
+        system_prompt=_SYSTEM_PROMPT_TEMPLATE.format(session_id=session_id),
         tools=[gateway_client, code_tools.execute_python_securely],
         model=bedrock_model,
         session_manager=session_manager,
@@ -110,11 +122,6 @@ def create_strands_agent(user_id: str, session_id: str) -> Agent:
 
 @app.entrypoint
 async def invocations(payload, context: RequestContext):
-    """Main entrypoint — called by AgentCore Runtime on each request.
-
-    Extracts user ID from the validated JWT token (not the payload body)
-    to prevent impersonation via prompt injection.
-    """
     user_query = payload.get("prompt")
     session_id = payload.get("runtimeSessionId")
 
@@ -125,9 +132,13 @@ async def invocations(payload, context: RequestContext):
         }
         return
 
+    if user_query == "warmup":
+        yield {"status": "warmup"}
+        return
+
     try:
         user_id = extract_user_id_from_context(context)
-        agent = create_strands_agent(user_id, session_id)
+        agent = create_market_trends_agent(user_id, session_id)
 
         async for event in agent.stream_async(user_query):
             yield json.loads(json.dumps(dict(event), default=str))

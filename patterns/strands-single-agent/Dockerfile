@@ -26,7 +26,7 @@ RUN uv pip install --no-cache -r requirements.txt && \
 RUN uv pip install --no-cache -e . --no-deps && \
     uv pip install --no-cache requests>=2.31.0
 
-# Create non-root user
+# Create non-root user and switch to it for the rest of the build and runtime
 RUN useradd -m -u 1000 bedrock_agentcore
 USER bedrock_agentcore
 
