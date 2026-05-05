@@ -1123,9 +1123,6 @@ export class BackendStack extends cdk.NestedStack {
       ),
       timeout: cdk.Duration.seconds(60),
       memorySize: 1024,
-      environment: {
-        AWS_DEFAULT_REGION: cdk.Stack.of(this).region,
-      },
       logGroup: new logs.LogGroup(this, "MarketDataToolLambdaLogGroup", {
         logGroupName: `/aws/lambda/${config.stack_name_base}-market-data-tool`,
         retention: logs.RetentionDays.ONE_WEEK,
@@ -1165,9 +1162,6 @@ export class BackendStack extends cdk.NestedStack {
       entry: path.join(__dirname, "../../gateway/tools/broker_card"), // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
       handler: "handler",
       timeout: cdk.Duration.seconds(60),
-      environment: {
-        AWS_DEFAULT_REGION: cdk.Stack.of(this).region,
-      },
       logGroup: new logs.LogGroup(this, "BrokerCardToolLambdaLogGroup", {
         logGroupName: `/aws/lambda/${config.stack_name_base}-broker-card-tool`,
         retention: logs.RetentionDays.ONE_WEEK,
@@ -1191,7 +1185,6 @@ export class BackendStack extends cdk.NestedStack {
       handler: "handler",
       timeout: cdk.Duration.seconds(30),
       environment: {
-        AWS_DEFAULT_REGION: cdk.Stack.of(this).region,
         MEMORY_ID: this.memoryId,
       },
       logGroup: new logs.LogGroup(this, "BrokerMemoryToolLambdaLogGroup", {
