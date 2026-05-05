@@ -164,6 +164,9 @@ def create_deployment_zip(package_dir: Path, output_path: Path) -> None:
 
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zipf:
         for root, dirs, files in os.walk(package_dir):
+            # Skip __pycache__ directories
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
+
             # Add directories
             for dir_name in dirs:
                 dir_path = Path(root) / dir_name
@@ -172,8 +175,10 @@ def create_deployment_zip(package_dir: Path, output_path: Path) -> None:
                 info.external_attr = 0o755 << 16
                 zipf.writestr(info, "")
 
-            # Add files
+            # Add files, skipping Python bytecode
             for file_name in files:
+                if file_name.endswith(".pyc") or file_name.endswith(".pyo"):
+                    continue
                 file_path = Path(root) / file_name
                 arcname = str(file_path.relative_to(package_dir))
                 info = zipfile.ZipInfo(arcname)

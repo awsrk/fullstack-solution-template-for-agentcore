@@ -8,7 +8,6 @@ import * as dynamodb from "aws-cdk-lib/aws-dynamodb"
 import * as apigateway from "aws-cdk-lib/aws-apigateway"
 import * as logs from "aws-cdk-lib/aws-logs"
 import * as s3 from "aws-cdk-lib/aws-s3"
-import * as ec2 from "aws-cdk-lib/aws-ec2"
 import * as agentcore from "@aws-cdk/aws-bedrock-agentcore-alpha"
 import * as bedrockagentcore from "aws-cdk-lib/aws-bedrockagentcore"
 import { PythonFunction } from "@aws-cdk/aws-lambda-python-alpha"
@@ -74,18 +73,14 @@ export class BackendStack extends cdk.NestedStack {
     // DEPLOYMENT ORDER EXPLANATION:
     // 1. Cognito User Pool & Client (created in separate CognitoStack)
     // 2. Machine Client & Resource Server (created above for M2M auth)
-    // 3. AgentCore Gateway (created next - uses machine client for auth)
-    // 4. AgentCore Runtime (created last - independent of gateway)
-    //
-    // This order ensures that authentication components are available before
-    // the gateway that depends on them, while keeping the runtime separate
-    // since it doesn't directly depend on the gateway.
+    // 3. AgentCore Runtime (created next - creates the Memory resource and sets this.memoryId)
+    // 4. AgentCore Gateway (created after Runtime - broker_memory Lambda needs MEMORY_ID env var)
 
-    // Create AgentCore Gateway (before Runtime)
-    this.createAgentCoreGateway(props.config)
-
-    // Create AgentCore Runtime resources
+    // Create AgentCore Runtime resources first so this.memoryId is available for Gateway Lambdas
     this.createAgentCoreRuntime(props.config, props)
+
+    // Create AgentCore Gateway (after Runtime so broker_memory Lambda gets MEMORY_ID)
+    this.createAgentCoreGateway(props.config)
 
     // Store runtime ARN in SSM for frontend stack
     this.createRuntimeSSMParameters(props.config)
@@ -125,46 +120,13 @@ export class BackendStack extends cdk.NestedStack {
   private createOrImportVpc(config: AppConfig): ec2.IVpc {
     const vpcConfig = config.backend.vpc
 
-    if (!vpcConfig || !vpcConfig.enabled) {
-      throw new Error("VPC configuration is required but not enabled")
+    if (!vpcConfig || !vpcConfig.vpc_id) {
+      throw new Error("VPC configuration with vpc_id is required when network_mode is VPC")
     }
 
-    // Import existing VPC if vpc_id is provided
-    if (vpcConfig.vpc_id) {
-      return ec2.Vpc.fromLookup(this, "ImportedVpc", {
-        vpcId: vpcConfig.vpc_id,
-      })
-    }
-
-    // Create new VPC with specified CIDR or default
-    const vpcCidr = vpcConfig.cidr || "10.0.0.0/16"
-
-    const vpc = new ec2.Vpc(this, "AgentCoreVpc", {
-      vpcName: `${config.stack_name_base}-agentcore-vpc`,
-      ipAddresses: ec2.IpAddresses.cidr(vpcCidr),
-      maxAzs: 2,
-      natGateways: 1, // NAT Gateway for Lambda/Runtime to access AWS services
-      subnetConfiguration: [
-        {
-          name: "Public",
-          subnetType: ec2.SubnetType.PUBLIC,
-          cidrMask: 24,
-        },
-        {
-          name: "Private",
-          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
-          cidrMask: 24,
-        },
-      ],
-      enableDnsHostnames: true,
-      enableDnsSupport: true,
+    return ec2.Vpc.fromLookup(this, "ImportedVpc", {
+      vpcId: vpcConfig.vpc_id,
     })
-
-    // Tag the VPC for identification
-    cdk.Tags.of(vpc).add("Name", `${config.stack_name_base}-agentcore-vpc`)
-    cdk.Tags.of(vpc).add("Purpose", "AgentCore Runtime VPC")
-
-    return vpc
   }
 
   /**
@@ -344,14 +306,30 @@ export class BackendStack extends cdk.NestedStack {
         }
       }
 
-      // Read shared modules (gateway/, tools/, patterns/utils/)
+      // Read pattern-local subdirectories first (e.g. tools/, utils/ inside the pattern dir)
+      // These take priority over top-level shared modules to allow per-pattern overrides.
+      for (const entry of fs.readdirSync(patternDir)) {
+        const fullPath = path.join(patternDir, entry) // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+        if (fs.statSync(fullPath).isDirectory()) {
+          this.readDirRecursive(fullPath, entry, agentCode)
+        }
+      }
+
+      // Read shared top-level modules (gateway/, tools/), skipping any keys already set
+      // by pattern-local directories above.
       for (const module of ["gateway", "tools"]) {
         const moduleDir = path.join(repoRoot, module) // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
         if (fs.existsSync(moduleDir)) {
-          this.readDirRecursive(moduleDir, module, agentCode)
+          const shared: Record<string, string> = {}
+          this.readDirRecursive(moduleDir, module, shared)
+          for (const [key, value] of Object.entries(shared)) {
+            if (!(key in agentCode)) {
+              agentCode[key] = value
+            }
+          }
         }
       }
-      
+
       // Read patterns/utils module (shared utilities for agents)
       const utilsDir = path.join(repoRoot, "patterns", "utils")
       if (fs.existsSync(utilsDir)) {
@@ -445,6 +423,14 @@ export class BackendStack extends cdk.NestedStack {
               Namespaces: ["/facts/{actorId}"],
             },
           },
+          {
+            // Captures user preferences (risk tolerance, investment style, etc.) across sessions.
+            // Used by broker_memory tools to personalise market analysis per broker.
+            UserPreferenceMemoryStrategy: {
+              Name: "BrokerPreferences",
+              Namespaces: ["/preferences/{actorId}"],
+            },
+          },
         ],
         MemoryExecutionRoleArn: agentRole.roleArn,
         Tags: {
@@ -498,6 +484,26 @@ export class BackendStack extends cdk.NestedStack {
           "bedrock-agentcore:InvokeCodeInterpreter",
         ],
         resources: [`arn:aws:bedrock-agentcore:${this.region}:aws:code-interpreter/*`],
+      })
+    )
+
+    // Add Browser Tool permissions (AgentCore managed browser for web scraping)
+    agentRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "BrowserToolAccess",
+        effect: iam.Effect.ALLOW,
+        actions: [
+          "bedrock-agentcore:GetBrowserSession",
+          "bedrock-agentcore:StartBrowserSession",
+          "bedrock-agentcore:StopBrowserSession",
+          "bedrock-agentcore:CreateBrowserSession",
+          "bedrock-agentcore:DeleteBrowserSession",
+          "bedrock-agentcore:ConnectBrowserAutomationStream",
+        ],
+        resources: [
+          `arn:aws:bedrock-agentcore:${this.region}:${this.account}:browser-custom/*`,
+          "arn:aws:bedrock-agentcore:*:aws:browser/*",
+        ],
       })
     )
 
@@ -568,8 +574,11 @@ export class BackendStack extends cdk.NestedStack {
     // requestHeaderConfiguration allows the agent to read the Authorization header
     // from RequestContext.request_headers, which is needed to securely extract the
     // user ID from the validated JWT token (sub claim) instead of trusting the payload body.
+    // The runtimeName includes a content hash suffix so code changes force a replacement
+    // rather than an in-place update (the AgentCore CFN handler fails on in-place updates).
+    const runtimeNameSuffix = contentHash ? `_${contentHash.slice(0, 8)}` : ""
     this.agentRuntime = new agentcore.Runtime(this, "Runtime", {
-      runtimeName: `${config.stack_name_base.replace(/-/g, "_")}_${this.agentName.valueAsString}`,
+      runtimeName: `${config.stack_name_base.replace(/-/g, "_")}_${this.agentName.valueAsString}${runtimeNameSuffix}`,
       agentRuntimeArtifact: agentRuntimeArtifact,
       executionRole: agentRole,
       networkConfiguration: networkConfiguration,
@@ -1105,14 +1114,110 @@ export class BackendStack extends cdk.NestedStack {
       }),
     })
 
+    // Market data tool Lambda — needs Playwright + AgentCore Browser; use Docker for binary deps
+    const marketDataLambda = new lambda.DockerImageFunction(this, "MarketDataToolLambda", {
+      functionName: `${config.stack_name_base}-market-data-tool`,
+      code: lambda.DockerImageCode.fromImageAsset(
+        path.join(__dirname, "../../gateway/tools/market_data"), // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+        { platform: ecr_assets.Platform.LINUX_ARM64 }
+      ),
+      timeout: cdk.Duration.seconds(60),
+      memorySize: 1024,
+      environment: {
+        AWS_DEFAULT_REGION: cdk.Stack.of(this).region,
+      },
+      logGroup: new logs.LogGroup(this, "MarketDataToolLambdaLogGroup", {
+        logGroupName: `/aws/lambda/${config.stack_name_base}-market-data-tool`,
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+
+    // Grant market data Lambda: Bedrock for Haiku inference + Browser tool
+    marketDataLambda.addToRolePolicy(new iam.PolicyStatement({
+      sid: "MarketDataBedrockAccess",
+      effect: iam.Effect.ALLOW,
+      actions: ["bedrock:InvokeModel"],
+      resources: ["arn:aws:bedrock:*::foundation-model/*", `arn:aws:bedrock:*:${this.account}:inference-profile/*`],
+    }))
+    marketDataLambda.addToRolePolicy(new iam.PolicyStatement({
+      sid: "MarketDataBrowserAccess",
+      effect: iam.Effect.ALLOW,
+      actions: [
+        "bedrock-agentcore:GetBrowserSession",
+        "bedrock-agentcore:StartBrowserSession",
+        "bedrock-agentcore:StopBrowserSession",
+        "bedrock-agentcore:CreateBrowserSession",
+        "bedrock-agentcore:DeleteBrowserSession",
+        "bedrock-agentcore:ConnectBrowserAutomationStream",
+      ],
+      resources: [
+        `arn:aws:bedrock-agentcore:${this.region}:${this.account}:browser-custom/*`,
+        "arn:aws:bedrock-agentcore:*:aws:browser/*",
+      ],
+    }))
+
+    // Broker card tool Lambda — pure Python, zip deployment
+    const brokerCardLambda = new PythonFunction(this, "BrokerCardToolLambda", {
+      functionName: `${config.stack_name_base}-broker-card-tool`,
+      runtime: lambda.Runtime.PYTHON_3_13,
+      architecture: lambda.Architecture.ARM_64,
+      entry: path.join(__dirname, "../../gateway/tools/broker_card"), // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+      handler: "handler",
+      timeout: cdk.Duration.seconds(60),
+      environment: {
+        AWS_DEFAULT_REGION: cdk.Stack.of(this).region,
+      },
+      logGroup: new logs.LogGroup(this, "BrokerCardToolLambdaLogGroup", {
+        logGroupName: `/aws/lambda/${config.stack_name_base}-broker-card-tool`,
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+
+    brokerCardLambda.addToRolePolicy(new iam.PolicyStatement({
+      sid: "BrokerCardBedrockAccess",
+      effect: iam.Effect.ALLOW,
+      actions: ["bedrock:InvokeModel"],
+      resources: ["arn:aws:bedrock:*::foundation-model/*", `arn:aws:bedrock:*:${this.account}:inference-profile/*`],
+    }))
+
+    // Broker memory tool Lambda — needs AgentCore Memory SDK, zip deployment
+    const brokerMemoryLambda = new PythonFunction(this, "BrokerMemoryToolLambda", {
+      functionName: `${config.stack_name_base}-broker-memory-tool`,
+      runtime: lambda.Runtime.PYTHON_3_13,
+      architecture: lambda.Architecture.ARM_64,
+      entry: path.join(__dirname, "../../gateway/tools/broker_memory"), // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+      handler: "handler",
+      timeout: cdk.Duration.seconds(30),
+      environment: {
+        AWS_DEFAULT_REGION: cdk.Stack.of(this).region,
+        MEMORY_ID: this.memoryId,
+      },
+      logGroup: new logs.LogGroup(this, "BrokerMemoryToolLambdaLogGroup", {
+        logGroupName: `/aws/lambda/${config.stack_name_base}-broker-memory-tool`,
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+
+    brokerMemoryLambda.addToRolePolicy(new iam.PolicyStatement({
+      sid: "BrokerMemoryAccess",
+      effect: iam.Effect.ALLOW,
+      actions: [
+        "bedrock-agentcore:CreateEvent",
+        "bedrock-agentcore:GetEvent",
+        "bedrock-agentcore:ListEvents",
+        "bedrock-agentcore:RetrieveMemoryRecords",
+      ],
+      resources: [this.memoryArn],
+    }))
+
     // Create comprehensive IAM role for gateway
     const gatewayRole = new iam.Role(this, "GatewayRole", {
       assumedBy: new iam.ServicePrincipal("bedrock-agentcore.amazonaws.com"),
       description: "Role for AgentCore Gateway with comprehensive permissions",
     })
-
-    // Lambda invoke permission
-    toolLambda.grantInvoke(gatewayRole)
 
     // Bedrock permissions (region-agnostic)
     gatewayRole.addToPolicy(
@@ -1280,31 +1385,67 @@ export class BackendStack extends cdk.NestedStack {
       description: "AgentCore Gateway with MCP protocol and JWT authentication",
     })
 
-    // Create Gateway Target using L1 construct (CfnGatewayTarget)
+    // Grant gateway role invoke on all tool Lambdas
+    toolLambda.grantInvoke(gatewayRole)
+    marketDataLambda.grantInvoke(gatewayRole)
+    brokerCardLambda.grantInvoke(gatewayRole)
+    brokerMemoryLambda.grantInvoke(gatewayRole)
+
+    // Load tool specs
+    const marketDataSpec = JSON.parse(fs.readFileSync(path.join(__dirname, "../../gateway/tools/market_data/tool_spec.json"), "utf8")) // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+    const brokerCardSpec = JSON.parse(fs.readFileSync(path.join(__dirname, "../../gateway/tools/broker_card/tool_spec.json"), "utf8")) // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+    const brokerMemorySpec = JSON.parse(fs.readFileSync(path.join(__dirname, "../../gateway/tools/broker_memory/tool_spec.json"), "utf8")) // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+
+    const credConfig = [{ credentialProviderType: "GATEWAY_IAM_ROLE" }]
+
+    // Sample tool target
     const gatewayTarget = new bedrockagentcore.CfnGatewayTarget(this, "GatewayTarget", {
       gatewayIdentifier: gateway.attrGatewayIdentifier,
       name: "sample-tool-target",
       description: "Sample tool Lambda target",
       targetConfiguration: {
-        mcp: {
-          lambda: {
-            lambdaArn: toolLambda.functionArn,
-            toolSchema: {
-              inlinePayload: apiSpec,
-            },
-          },
-        },
+        mcp: { lambda: { lambdaArn: toolLambda.functionArn, toolSchema: { inlinePayload: apiSpec } } },
       },
-      credentialProviderConfigurations: [
-        {
-          credentialProviderType: "GATEWAY_IAM_ROLE",
-        },
-      ],
+      credentialProviderConfigurations: credConfig,
+    })
+
+    // Market data target (get_stock_data, search_news)
+    const marketDataTarget = new bedrockagentcore.CfnGatewayTarget(this, "MarketDataTarget", {
+      gatewayIdentifier: gateway.attrGatewayIdentifier,
+      name: "market-data-target",
+      description: "Live stock prices and financial news via AgentCore Browser",
+      targetConfiguration: {
+        mcp: { lambda: { lambdaArn: marketDataLambda.functionArn, toolSchema: { inlinePayload: marketDataSpec } } },
+      },
+      credentialProviderConfigurations: credConfig,
+    })
+
+    // Broker card target (parse_broker_profile_from_message, generate_market_summary_for_broker, etc.)
+    const brokerCardTarget = new bedrockagentcore.CfnGatewayTarget(this, "BrokerCardTarget", {
+      gatewayIdentifier: gateway.attrGatewayIdentifier,
+      name: "broker-card-target",
+      description: "Broker profile parsing and tailored market summary generation",
+      targetConfiguration: {
+        mcp: { lambda: { lambdaArn: brokerCardLambda.functionArn, toolSchema: { inlinePayload: brokerCardSpec } } },
+      },
+      credentialProviderConfigurations: credConfig,
+    })
+
+    // Broker memory target (identify_broker, get/update broker profile, conversation history)
+    const brokerMemoryTarget = new bedrockagentcore.CfnGatewayTarget(this, "BrokerMemoryTarget", {
+      gatewayIdentifier: gateway.attrGatewayIdentifier,
+      name: "broker-memory-target",
+      description: "Persistent broker financial profiles via AgentCore Memory",
+      targetConfiguration: {
+        mcp: { lambda: { lambdaArn: brokerMemoryLambda.functionArn, toolSchema: { inlinePayload: brokerMemorySpec } } },
+      },
+      credentialProviderConfigurations: credConfig,
     })
 
     // Ensure proper creation order
-    gatewayTarget.addDependency(gateway)
-    gateway.node.addDependency(toolLambda)
+    for (const target of [gatewayTarget, marketDataTarget, brokerCardTarget, brokerMemoryTarget]) {
+      target.addDependency(gateway)
+    }
     gateway.node.addDependency(this.machineClient)
     gateway.node.addDependency(gatewayRole)
 
@@ -1329,16 +1470,6 @@ export class BackendStack extends cdk.NestedStack {
     new cdk.CfnOutput(this, "GatewayArn", {
       value: gateway.attrGatewayArn,
       description: "AgentCore Gateway ARN",
-    })
-
-    new cdk.CfnOutput(this, "GatewayTargetId", {
-      value: gatewayTarget.ref,
-      description: "AgentCore Gateway Target ID",
-    })
-
-    new cdk.CfnOutput(this, "ToolLambdaArn", {
-      description: "ARN of the sample tool Lambda",
-      value: toolLambda.functionArn,
     })
   }
 

@@ -38,7 +38,7 @@ cors_config = CORSConfig(
 
 # Initialize AWS clients
 dynamodb = boto3.client("dynamodb")
-agentcore_memory = boto3.client("bedrock-agent-runtime")
+agentcore_memory = boto3.client("bedrock-agentcore-runtime")
 
 tracer = Tracer()
 logger = Logger()
@@ -234,7 +234,7 @@ def get_tools() -> Dict[str, Any]:
     Handle GET /tools endpoint.
 
     Returns:
-        List of available tools
+        List of available tools from the AgentCore Gateway
     """
     try:
         # Extract user ID from Cognito claims for authentication
