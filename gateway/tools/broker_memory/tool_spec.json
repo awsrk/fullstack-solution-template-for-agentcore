@@ -1,0 +1,74 @@
+[
+  {
+    "name": "identify_broker",
+    "description": "Identify a broker from their message and return their consistent actor_id. Call this FIRST whenever a user includes a name, broker card, or any identity information.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "user_message": {
+          "type": "string",
+          "description": "The user's message containing identity information"
+        }
+      },
+      "required": ["user_message"]
+    }
+  },
+  {
+    "name": "get_broker_financial_profile",
+    "description": "Retrieve the long-term financial profile for a broker across all memory strategies and sessions.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "actor_id": {
+          "type": "string",
+          "description": "The actor_id returned by identify_broker"
+        },
+        "session_id": {
+          "type": "string",
+          "description": "The current session ID (runtimeSessionId from the request)"
+        }
+      },
+      "required": ["actor_id", "session_id"]
+    }
+  },
+  {
+    "name": "update_broker_financial_interests",
+    "description": "Persist new financial interests, preferences, or profile updates for a broker in long-term memory.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "interests_update": {
+          "type": "string",
+          "description": "Profile information to store (preferences, risk tolerance, sectors, etc.)"
+        },
+        "actor_id": {
+          "type": "string",
+          "description": "The actor_id returned by identify_broker"
+        },
+        "session_id": {
+          "type": "string",
+          "description": "The current session ID (runtimeSessionId from the request)"
+        }
+      },
+      "required": ["interests_update", "actor_id", "session_id"]
+    }
+  },
+  {
+    "name": "list_conversation_history",
+    "description": "Retrieve recent conversation history for a broker across sessions.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "actor_id": {
+          "type": "string",
+          "description": "The actor_id returned by identify_broker"
+        },
+        "session_id": {
+          "type": "string",
+          "description": "The current session ID (runtimeSessionId from the request)"
+        }
+      },
+      "required": ["actor_id", "session_id"]
+    }
+  }
+]

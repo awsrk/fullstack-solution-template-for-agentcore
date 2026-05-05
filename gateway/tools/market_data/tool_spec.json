@@ -1,0 +1,34 @@
+[
+  {
+    "name": "get_stock_data",
+    "description": "Get live stock price, daily change, and key market data for a ticker symbol.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "symbol": {
+          "type": "string",
+          "description": "Stock ticker symbol, e.g. AAPL, MSFT, AMZN"
+        }
+      },
+      "required": ["symbol"]
+    }
+  },
+  {
+    "name": "search_news",
+    "description": "Search financial news sources for market headlines and highlights.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Search query — company name, sector, or topic"
+        },
+        "news_source": {
+          "type": "string",
+          "description": "News source: bloomberg (default), yahoo finance, marketwatch, reuters, cnbc, wsj, financial times, seeking alpha"
+        }
+      },
+      "required": ["query"]
+    }
+  }
+]

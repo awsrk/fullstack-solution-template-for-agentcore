@@ -1,0 +1,56 @@
+[
+  {
+    "name": "parse_broker_profile_from_message",
+    "description": "Parse structured broker profile information from a user message in broker card format (Name:, Company:, Role:, Industry Interests:, etc.).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "user_message": {
+          "type": "string",
+          "description": "User message containing broker profile fields"
+        }
+      },
+      "required": ["user_message"]
+    }
+  },
+  {
+    "name": "generate_market_summary_for_broker",
+    "description": "Generate a tailored market trends summary based on a broker's stored profile.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "broker_profile": {
+          "type": "string",
+          "description": "The broker's profile information"
+        },
+        "market_data": {
+          "type": "string",
+          "description": "Optional additional market data or news to incorporate"
+        }
+      },
+      "required": ["broker_profile"]
+    }
+  },
+  {
+    "name": "get_broker_card_template",
+    "description": "Return the standard broker card template so a new broker can fill in their profile.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "collect_broker_preferences_interactively",
+    "description": "Return the right question to collect a specific missing broker preference.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "preference_type": {
+          "type": "string",
+          "description": "One of: industries, risk, strategy, news, clients, geography, recent"
+        }
+      },
+      "required": ["preference_type"]
+    }
+  }
+]
