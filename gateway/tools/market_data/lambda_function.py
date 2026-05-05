@@ -13,7 +13,7 @@ from playwright.sync_api import sync_playwright
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 _NEWS_URLS = {
     "bloomberg": "https://www.bloomberg.com/search?query={q}",
